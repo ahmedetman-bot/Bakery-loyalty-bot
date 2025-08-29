@@ -1,3 +1,4 @@
+// server.js — bakery loyalty bot
 import express from 'express';
 import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
@@ -8,6 +9,7 @@ const app = express();
 app.use(bodyParser.json());
 
 const {
+  PORT = 3000,
   VERIFY_TOKEN,
   WHATSAPP_TOKEN,
   WHATSAPP_PHONE_ID,
@@ -16,47 +18,80 @@ const {
   GOOGLE_PRIVATE_KEY,
 } = process.env;
 
-// ✅ Webhook GET (Meta Verification)
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+// ========== Google Sheet ==========
+async function openDoc() {
+  const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID);
+  const auth = new JWT({
+    email: GOOGLE_SERVICE_EMAIL,
+    key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  await doc.useJwtAuth(auth);
+  await doc.loadInfo();
+  return doc;
+}
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('✅ Webhook verified');
-    return res.status(200).send(challenge);
-  } else {
-    return res.sendStatus(403);
+async function getSettings(doc) {
+  const sheet = doc.sheetsByTitle['Settings'];
+  await sheet.loadCells('A1:B10');
+  const config = {};
+  for (let r = 1; r < 10; r++) {
+    const key = sheet.getCell(r, 0).value;
+    const val = sheet.getCell(r, 1).value;
+    if (!key) break;
+    config[key.toString().trim()] = val?.toString().trim();
   }
-});
+  return {
+    EGP_PER_POINT: Number(config['EGP PER POINT'] || 50),
+    MIN_BILL: Number(config['MIN BILL'] || 70),
+    DAILY_PIN: config['DAILY PIN'] || '',
+    DAILY_POINT_CAP: Number(config['DAILY POINT CAP'] || 8),
+  };
+}
 
-// ✅ Webhook POST (رسائل واتساب)
-app.post('/webhook', async (req, res) => {
-  try {
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) return res.sendStatus(200);
-
-    const from = msg.from;
-    const text = msg.text?.body;
-
-    // ✅ سجل الزيارة في Google Sheet
-    await logVisit(from, text);
-
-    // ✅ رد على العميل
-    await sendWhatsappText(from, '📌 تم تسجيل زيارتك بنجاح! شكراً ليك 🎉');
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('❌ Error in /webhook:', err);
-    return res.sendStatus(500);
+async function getOrCreateCustomer(doc, phone) {
+  let sheet = doc.sheetsByTitle['Customers'];
+  if (!sheet) {
+    sheet = await doc.addSheet({
+      title: 'Customers',
+      headerValues: ['phone', 'points', 'visits', 'last_invoice', 'updated_at'],
+    });
   }
-});
+  const rows = await sheet.getRows();
+  let row = rows.find(r => (r.phone || '').toString() === phone);
+  if (!row) {
+    row = await sheet.addRow({
+      phone,
+      points: 0,
+      visits: 0,
+      last_invoice: '',
+      updated_at: new Date().toISOString(),
+    });
+  }
+  return { sheet, row };
+}
 
-// ✅ Send Message to WhatsApp
-async function sendWhatsappText(to, body) {
+async function addTxn(doc, { phone, amount, points, invoice }) {
+  let sheet = doc.sheetsByTitle['Txns'];
+  if (!sheet) {
+    sheet = await doc.addSheet({
+      title: 'Txns',
+      headerValues: ['ts', 'phone', 'amount', 'points', 'invoice'],
+    });
+  }
+  await sheet.addRow({
+    ts: new Date().toISOString(),
+    phone,
+    amount,
+    points,
+    invoice,
+  });
+}
+
+// ========== WhatsApp API ==========
+async function sendWhats(to, body) {
   const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`;
-
-  const response = await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${WHATSAPP_TOKEN}`,
@@ -69,38 +104,92 @@ async function sendWhatsappText(to, body) {
       text: { body },
     }),
   });
-
-  const data = await response.json();
-  console.log('📤 OUTGOING:', data);
+  const data = await res.json();
+  console.log('OUT:', data);
 }
 
-// ✅ Log visits to Google Sheet
-async function logVisit(phone, message) {
-  const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID);
+// ========== Webhook ==========
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
 
-  const serviceAuth = new JWT({
-    email: GOOGLE_SERVICE_EMAIL,
-    key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
+app.post('/webhook', async (req, res) => {
+  try {
+    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!msg) return res.sendStatus(200);
 
-  await doc.useJwtAuth(serviceAuth);
-  await doc.loadInfo();
+    const from = msg.from;
+    const text = (msg.text?.body || '').trim();
+    console.log('IN:', from, text);
 
-  const sheet = doc.sheetsByTitle['Visits'];
-  await sheet.addRow({
-    phone,
-    message,
-    date: new Date().toLocaleString('en-EG', { timeZone: 'Africa/Cairo' }),
-  });
+    // start
+    if (/^start$/i.test(text)) {
+      await sendWhats(from, '👋 Welcome!\nUse:\n- `add 150 1234 INV001`\n- `points` to view your balance.');
+      return res.sendStatus(200);
+    }
 
-  console.log('📝 Visit saved to sheet');
-}
+    // points
+    if (/^points$/i.test(text)) {
+      const doc = await openDoc();
+      const { row } = await getOrCreateCustomer(doc, from);
+      await sendWhats(from, `⭐ You have ${row.points || 0} loyalty points.`);
+      return res.sendStatus(200);
+    }
 
-// ✅ Base route
-app.get('/', (req, res) => res.send('Bakery Loyalty Bot is running 🚀'));
+    // add 150 1234 INV001
+    const match = text.match(/^add\s+(\d+(?:\.\d+)?)\s+(\d+)\s+([\w\-]+)/i);
+    if (match) {
+      const amount = Number(match[1]);
+      const pin = match[2];
+      const invoice = match[3];
 
-const PORT = process.env.PORT || 3000;
+      const doc = await openDoc();
+      const cfg = await getSettings(doc);
+
+      if (pin !== cfg.DAILY_PIN) {
+        await sendWhats(from, '❌ Invalid PIN.');
+        return res.sendStatus(200);
+      }
+
+      if (amount < cfg.MIN_BILL) {
+        await sendWhats(from, `⚠️ Min bill is ${cfg.MIN_BILL} EGP.`);
+        return res.sendStatus(200);
+      }
+
+      let points = Math.floor(amount / cfg.EGP_PER_POINT);
+      points = Math.min(points, cfg.DAILY_POINT_CAP);
+
+      const { row } = await getOrCreateCustomer(doc, from);
+      row.points = Number(row.points || 0) + points;
+      row.visits = Number(row.visits || 0) + 1;
+      row.last_invoice = invoice;
+      row.updated_at = new Date().toISOString();
+      await row.save();
+
+      await addTxn(doc, { phone: from, amount, points, invoice });
+
+      await sendWhats(
+        from,
+        `✅ Added.\n💰 Amount: ${amount} EGP\n🎯 Points earned: ${points}\n⭐ Total: ${row.points}`
+      );
+      return res.sendStatus(200);
+    }
+
+    await sendWhats(from, '🤖 I didn’t understand.\nType `start`.');
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error('ERR:', e);
+    return res.sendStatus(200);
+  }
+});
+
+// ========== Health check ==========
+app.get('/', (_, res) => res.send('✅ Bot running'));
+
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`Bot running on port ${PORT}`);
 });
