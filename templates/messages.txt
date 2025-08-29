@@ -1,0 +1,19 @@
+[start]
+👋 Welcome to [Bakery Name] Loyalty!
+Commands:
+- start (join)
+- points (see your balance)
+- add <bill> <PIN> [invoice]
+- rewards (list rewards)
+- redeem <id> (use a reward)
+
+[add_success]
+✅ Points added: {X} (Bill: EGP {BILL})
+Balance: {BAL} pts | Tier: {TIER}
+🎁 Tip: reply "rewards" to see gifts
+
+[pin_invalid]
+❌ Invalid or expired PIN. Ask the cashier for today's PIN.
+
+[points]
+📊 Balance: {BAL} pts | Tier: {TIER}
