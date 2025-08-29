@@ -1,9 +1,7 @@
-// server.js — bakery loyalty bot
-import express from 'express';
-import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
-import { GoogleSpreadsheet } from 'google-spreadsheet';
-import { JWT } from 'google-auth-library';
+const express = require('express');
+const bodyParser = require('body-parser');
+const fetch = require('node-fetch');
+const GoogleSpreadsheet = require('google-spreadsheet');
 
 const app = express();
 app.use(bodyParser.json());
@@ -18,77 +16,28 @@ const {
   GOOGLE_PRIVATE_KEY,
 } = process.env;
 
-// ========== Google Sheet ==========
+// ========== Google Sheet - V2 ==========
 async function openDoc() {
   const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID);
-  const auth = new JWT({
-    email: GOOGLE_SERVICE_EMAIL,
-    key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+
+  await new Promise((resolve, reject) => {
+    doc.useServiceAccountAuth(
+      {
+        client_email: GOOGLE_SERVICE_EMAIL,
+        private_key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      },
+      (err) => (err ? reject(err) : resolve())
+    );
   });
-  await doc.useJwtAuth(auth);
-  await doc.loadInfo();
-  return doc;
-}
 
-async function getSettings(doc) {
-  const sheet = doc.sheetsByTitle['Settings'];
-  await sheet.loadCells('A1:B10');
-  const config = {};
-  for (let r = 1; r < 10; r++) {
-    const key = sheet.getCell(r, 0).value;
-    const val = sheet.getCell(r, 1).value;
-    if (!key) break;
-    config[key.toString().trim()] = val?.toString().trim();
-  }
-  return {
-    EGP_PER_POINT: Number(config['EGP PER POINT'] || 50),
-    MIN_BILL: Number(config['MIN BILL'] || 70),
-    DAILY_PIN: config['DAILY PIN'] || '',
-    DAILY_POINT_CAP: Number(config['DAILY POINT CAP'] || 8),
-  };
-}
-
-async function getOrCreateCustomer(doc, phone) {
-  let sheet = doc.sheetsByTitle['Customers'];
-  if (!sheet) {
-    sheet = await doc.addSheet({
-      title: 'Customers',
-      headerValues: ['phone', 'points', 'visits', 'last_invoice', 'updated_at'],
-    });
-  }
-  const rows = await sheet.getRows();
-  let row = rows.find(r => (r.phone || '').toString() === phone);
-  if (!row) {
-    row = await sheet.addRow({
-      phone,
-      points: 0,
-      visits: 0,
-      last_invoice: '',
-      updated_at: new Date().toISOString(),
-    });
-  }
-  return { sheet, row };
-}
-
-async function addTxn(doc, { phone, amount, points, invoice }) {
-  let sheet = doc.sheetsByTitle['Txns'];
-  if (!sheet) {
-    sheet = await doc.addSheet({
-      title: 'Txns',
-      headerValues: ['ts', 'phone', 'amount', 'points', 'invoice'],
-    });
-  }
-  await sheet.addRow({
-    ts: new Date().toISOString(),
-    phone,
-    amount,
-    points,
-    invoice,
+  const info = await new Promise((resolve, reject) => {
+    doc.getInfo((err, info) => (err ? reject(err) : resolve(info)));
   });
+
+  return info;
 }
 
-// ========== WhatsApp API ==========
+// ========== WhatsApp ==========
 async function sendWhats(to, body) {
   const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`;
   const res = await fetch(url, {
@@ -126,57 +75,21 @@ app.post('/webhook', async (req, res) => {
     const text = (msg.text?.body || '').trim();
     console.log('IN:', from, text);
 
-    // start
     if (/^start$/i.test(text)) {
-      await sendWhats(from, '👋 Welcome!\nUse:\n- `add 150 1234 INV001`\n- `points` to view your balance.');
+      await sendWhats(from, '👋 Welcome!\nReply with `points` to check points.');
       return res.sendStatus(200);
     }
 
-    // points
     if (/^points$/i.test(text)) {
-      const doc = await openDoc();
-      const { row } = await getOrCreateCustomer(doc, from);
-      await sendWhats(from, `⭐ You have ${row.points || 0} loyalty points.`);
-      return res.sendStatus(200);
-    }
-
-    // add 150 1234 INV001
-    const match = text.match(/^add\s+(\d+(?:\.\d+)?)\s+(\d+)\s+([\w\-]+)/i);
-    if (match) {
-      const amount = Number(match[1]);
-      const pin = match[2];
-      const invoice = match[3];
-
-      const doc = await openDoc();
-      const cfg = await getSettings(doc);
-
-      if (pin !== cfg.DAILY_PIN) {
-        await sendWhats(from, '❌ Invalid PIN.');
+      const info = await openDoc();
+      const sheet = info.worksheets.find(w => w.title === 'Customers');
+      sheet.getRows((err, rows) => {
+        const row = rows.find(r => r.phone === from);
+        const pts = row?.points || 0;
+        sendWhats(from, `⭐ You have ${pts} points`);
         return res.sendStatus(200);
-      }
-
-      if (amount < cfg.MIN_BILL) {
-        await sendWhats(from, `⚠️ Min bill is ${cfg.MIN_BILL} EGP.`);
-        return res.sendStatus(200);
-      }
-
-      let points = Math.floor(amount / cfg.EGP_PER_POINT);
-      points = Math.min(points, cfg.DAILY_POINT_CAP);
-
-      const { row } = await getOrCreateCustomer(doc, from);
-      row.points = Number(row.points || 0) + points;
-      row.visits = Number(row.visits || 0) + 1;
-      row.last_invoice = invoice;
-      row.updated_at = new Date().toISOString();
-      await row.save();
-
-      await addTxn(doc, { phone: from, amount, points, invoice });
-
-      await sendWhats(
-        from,
-        `✅ Added.\n💰 Amount: ${amount} EGP\n🎯 Points earned: ${points}\n⭐ Total: ${row.points}`
-      );
-      return res.sendStatus(200);
+      });
+      return;
     }
 
     await sendWhats(from, '🤖 I didn’t understand.\nType `start`.');
