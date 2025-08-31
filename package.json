@@ -6,11 +6,12 @@
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "axios": "^1.7.0",
-    "dotenv": "^16.4.0",
-    "express": "^4.19.2",
-    "google-spreadsheet": "^4.1.2",
-    "body-parser": "^1.20.2"
-  }
+ "dependencies": {
+  "axios": "^1.7.0",
+  "body-parser": "^1.20.2",
+  "dotenv": "^16.4.0",
+  "express": "^4.19.2",
+  "google-spreadsheet": "^4.1.2",
+  "google-auth-library": "^9.14.1"
+}
 }
