@@ -1,63 +1,65 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const fetch = require('node-fetch');
-const GoogleSpreadsheet = require('google-spreadsheet');
+// server.js
+import 'dotenv/config';
+import express from 'express';
+import bodyParser from 'body-parser';
+import axios from 'axios';
+import { GoogleSpreadsheet } from 'google-spreadsheet';
+import { JWT } from 'google-auth-library';
 
 const app = express();
 app.use(bodyParser.json());
 
-const {
-  PORT = 3000,
-  VERIFY_TOKEN,
-  WHATSAPP_TOKEN,
-  WHATSAPP_PHONE_ID,
-  GOOGLE_SHEET_ID,
-  GOOGLE_SERVICE_EMAIL,
-  GOOGLE_PRIVATE_KEY,
-} = process.env;
+// ===== ENV =====
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ahmedtoken123';
+const WA_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 
-// ========== Google Sheet - V2 ==========
-async function openDoc() {
-  const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID);
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const SERVICE_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
+const PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 
-  await new Promise((resolve, reject) => {
-    doc.useServiceAccountAuth(
-      {
-        client_email: GOOGLE_SERVICE_EMAIL,
-        private_key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      },
-      (err) => (err ? reject(err) : resolve())
-    );
-  });
+const BAKERY_NAME = process.env.BAKERY_NAME || 'Le Blounger';
 
-  const info = await new Promise((resolve, reject) => {
-    doc.getInfo((err, info) => (err ? reject(err) : resolve(info)));
-  });
-
-  return info;
+// ===== WhatsApp helper =====
+async function sendText(to, body) {
+  const url = `https://graph.facebook.com/v20.0/${PHONE_ID}/messages`;
+  const res = await axios.post(
+    url,
+    { messaging_product: 'whatsapp', to, type: 'text', text: { body } },
+    { headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+  console.log('OUT:', res.data);
+  return res.data;
 }
 
-// ========== WhatsApp ==========
-async function sendWhats(to, body) {
-  const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to,
-      type: 'text',
-      text: { body },
-    }),
-  });
-  const data = await res.json();
-  console.log('OUT:', data);
+// ===== Google Sheets (v4 with JWT) =====
+const auth = new JWT({
+  email: SERVICE_EMAIL,
+  key: PRIVATE_KEY,
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
+const doc = new GoogleSpreadsheet(SHEET_ID, auth);
+
+let sheetsReady = false;
+async function initSheets() {
+  if (sheetsReady) return;
+  await doc.loadInfo(); // يحمل أسماء التابات
+  sheetsReady = true;
 }
 
-// ========== Webhook ==========
+// (اختياري) دوال سريعة للتعامل مع الشيت لو هتحتاج لاحقًا
+async function findOrCreateCustomer(phone, name = '') {
+  const sh = doc.sheetsByTitle['Customers'];
+  const rows = await sh.getRows();
+  let row = rows.find(r => (r.Phone || '').trim() === phone);
+  if (!row) {
+    await sh.addRow({ Phone: phone, Name: name, Tier: 'Bronze', Points: 0, JoinedAt: new Date().toISOString() });
+    return { Phone: phone, Name: name, Tier: 'Bronze', Points: 0 };
+  }
+  return { Phone: row.Phone, Name: row.Name, Tier: row.Tier, Points: Number(row.Points || 0) };
+}
+
+// ===== Webhook verify (GET) =====
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -66,43 +68,47 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
+// ===== Webhook receive (POST) =====
 app.post('/webhook', async (req, res) => {
   try {
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const change = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const msg = change?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
     const from = msg.from;
+    const name = change?.contacts?.[0]?.profile?.name || '';
     const text = (msg.text?.body || '').trim();
-    console.log('IN:', from, text);
+    const lower = text.toLowerCase();
 
-    if (/^start$/i.test(text)) {
-      await sendWhats(from, '👋 Welcome!\nReply with `points` to check points.');
+    await initSheets();
+    await findOrCreateCustomer(from, name); // مجرد تسجيل أول مرة
+
+    if (lower === 'start') {
+      const welcome =
+        process.env.WELCOME_TEXT ||
+        [
+          `🎉 أهلاً بيك في ${BAKERY_NAME} 🎉`,
+          '',
+          'سعداء بزيارتك! من النهاردة هتكسب نقاط على كل عملية شراء.',
+          '📌 مثال: كل 50 جنيه = 1 نقطة',
+          '🎁 اجمع نقاطك واستبدلها بعروض وهدايا.',
+          '',
+          'اكتب: points (رصيدك) | rewards (الهدايا) | add <المبلغ> <PIN> لإضافة نقاط.',
+        ].join('\n');
+      await sendText(from, welcome);
       return res.sendStatus(200);
     }
 
-    if (/^points$/i.test(text)) {
-      const info = await openDoc();
-      const sheet = info.worksheets.find(w => w.title === 'Customers');
-      sheet.getRows((err, rows) => {
-        const row = rows.find(r => r.phone === from);
-        const pts = row?.points || 0;
-        sendWhats(from, `⭐ You have ${pts} points`);
-        return res.sendStatus(200);
-      });
-      return;
-    }
-
-    await sendWhats(from, '🤖 I didn’t understand.\nType `start`.');
+    // رد افتراضي
+    await sendText(from, 'اكتب "start" لعرض القائمة 👇');
     return res.sendStatus(200);
   } catch (e) {
-    console.error('ERR:', e);
+    console.error('ERR:', e?.response?.data || e);
     return res.sendStatus(200);
   }
 });
 
-// ========== Health check ==========
-app.get('/', (_, res) => res.send('✅ Bot running'));
-
-app.listen(PORT, () => {
-  console.log(`Bot running on port ${PORT}`);
-});
+// Health
+app.get('/', (_, res) => res.send('OK'));
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log('Bot running on', port));
